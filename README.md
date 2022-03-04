@@ -8,3 +8,12 @@
 
 This project is implemented in [Python](https://www.python.org/) and models implemented in [PyTorch](https://pytorch.org/).
 
+To run, install the requirements using pip:
+```bash
+pip install -r requirements.txt
+```
+
+Then execute the script:
+```bash
+python main.py
+```
