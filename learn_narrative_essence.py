@@ -847,7 +847,7 @@ if __name__ == "__main__":
     args.ordering_encoder_weight_decay = 1e-5
 
     print("train narrative essence extractor")
-    #train_model(args)
+    train_model(args)
 
     args.small_dataset = True
     args.use_available_feature = True
