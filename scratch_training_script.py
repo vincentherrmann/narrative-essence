@@ -4,14 +4,28 @@ from types import SimpleNamespace
 
 if __name__ == "__main__":
     args = SimpleNamespace()
-    args.save_model = True
-    args.small_dataset = False
+    args.save_model = False
+    args.small_dataset = True
     args.normalize_features = True
-    args.use_available_feature = False
-    args.available_feature_to_use = "learned"
+    args.include_learned_feature = True
+    args.song_features = "all"
+    # options:
+    # "acousticness"
+    # "danceability"
+    # "energy"
+    # "instrumentalness"
+    # "liveness"
+    # "speechiness"
+    # "tempo"
+    # "valence"
+    # "duration"
+    # "precomputed_learned"
+    # "learned_frozen"
+    # "learned"
+    # "pca"
 
     args.num_negative_examples = 31
-    args.patience_epochs = 20
+    args.patience_epochs = 50
     args.feature_encoder_type = "lstm"
     args.feature_encoder_hidden_units = 128
     args.feature_encoder_num_layers = 2

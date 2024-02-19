@@ -1,0 +1,100 @@
+<!-- You must include this JavaScript file -->
+<script src="https://assets.crowd.aws/crowd-html-elements.js"></script>
+
+<!-- You must include crowd-form so that your task submits answers to MTurk -->
+<crowd-form answer-format="flatten-objects">
+    <h3>Instructions</h3>
+    <p>Listen to these sections from songs of a music album.</p>
+    <p>Which order do you find creates a more meaningful, interesting or enjoyable narrative? Choose either side A or side B, and provide a brief explanation for your choice.</p>
+
+    <!-- Container for the audio columns with center-aligned headings -->
+    <div style="display:flex; justify-content:flex-start;">
+        <!-- Column A with center-aligned heading and adjusted width -->
+        <div style="text-align: center; margin-right: 100px;" id="columnA">
+            <h4 style="margin-bottom: 20px;">Order A</h4>
+        </div>
+
+        <!-- Column B with center-aligned heading and adjusted width -->
+        <div style="text-align: center;" id="columnB">
+            <h4 style="margin-bottom: 20px;">Order B</h4>
+        </div>
+    </div>
+
+    <!-- User choice -->
+    <div>
+        <p>Select your preference:</p>
+        <crowd-radio-group name="column_preference" required>
+            <crowd-radio-button name="A" value="A">Order A</crowd-radio-button>
+            <crowd-radio-button name="B" value="B">Order B</crowd-radio-button>
+        </crowd-radio-group>
+    </div>
+
+    <!-- Explanation field -->
+    <div>
+        <p>Please explain your choice:</p>
+        <crowd-text-area name="explanation" placeholder="Type your explanation here..." rows="3" required></crowd-text-area>
+    </div>
+</crowd-form>
+
+<script>
+    const columnA = document.getElementById('columnA');
+    const columnB = document.getElementById('columnB');
+    const num_tracks = ${num_tracks}; // Updated to use the dynamic number of tracks
+
+    // create a list of track urls
+    const trackUrlsA = [
+        'https://narrative-essence-survey.s3.amazonaws.com/survey_selection/${album_id}/${a_track_1}',
+        'https://narrative-essence-survey.s3.amazonaws.com/survey_selection/${album_id}/${a_track_2}',
+        'https://narrative-essence-survey.s3.amazonaws.com/survey_selection/${album_id}/${a_track_3}',
+        'https://narrative-essence-survey.s3.amazonaws.com/survey_selection/${album_id}/${a_track_4}',
+        'https://narrative-essence-survey.s3.amazonaws.com/survey_selection/${album_id}/${a_track_5}',
+        'https://narrative-essence-survey.s3.amazonaws.com/survey_selection/${album_id}/${a_track_6}',
+        'https://narrative-essence-survey.s3.amazonaws.com/survey_selection/${album_id}/${a_track_7}',
+        'https://narrative-essence-survey.s3.amazonaws.com/survey_selection/${album_id}/${a_track_8}',
+        'https://narrative-essence-survey.s3.amazonaws.com/survey_selection/${album_id}/${a_track_9}',
+    ];
+    const trackUrlsB = [
+        'https://narrative-essence-survey.s3.amazonaws.com/survey_selection/${album_id}/${b_track_1}',
+        'https://narrative-essence-survey.s3.amazonaws.com/survey_selection/${album_id}/${b_track_2}',
+        'https://narrative-essence-survey.s3.amazonaws.com/survey_selection/${album_id}/${b_track_3}',
+        'https://narrative-essence-survey.s3.amazonaws.com/survey_selection/${album_id}/${b_track_4}',
+        'https://narrative-essence-survey.s3.amazonaws.com/survey_selection/${album_id}/${b_track_5}',
+        'https://narrative-essence-survey.s3.amazonaws.com/survey_selection/${album_id}/${b_track_6}',
+        'https://narrative-essence-survey.s3.amazonaws.com/survey_selection/${album_id}/${b_track_7}',
+        'https://narrative-essence-survey.s3.amazonaws.com/survey_selection/${album_id}/${b_track_8}',
+        'https://narrative-essence-survey.s3.amazonaws.com/survey_selection/${album_id}/${b_track_9}',
+    ]
+
+
+    // Function to create and append audio elements with vertically centered track labels
+    function appendAudioElements(column, trackPrefix, variablePrefix) {
+        for (let i = 1; i <= num_tracks; i++) {
+            const div = document.createElement('div');
+            div.style.display = 'flex';
+            div.style.alignItems = 'center'; // Vertically center the text and audio controls
+
+            const audio = document.createElement('audio');
+            audio.controls = true;
+            // get the audio source from the list of track urls
+            if (trackPrefix === 'A') {
+                audio.src = trackUrlsA[i-1];
+            } else {
+                audio.src = trackUrlsB[i-1];
+            }
+
+            const numbering = document.createElement('span');
+            // create text content, but do not use ${} to avoid conflicts with other code
+            numbering.textContent = trackPrefix + ' Track ' + i + ': ';
+            numbering.style.marginRight = '10px'; // Add some spacing between the label and the audio control
+
+            div.appendChild(numbering);
+            div.appendChild(audio);
+
+            column.appendChild(div); // Append the div instead of individual elements
+        }
+    }
+
+    // Call the function for each column with the appropriate parameters
+    appendAudioElements(columnA, 'A', '$a_track_');
+    appendAudioElements(columnB, 'B', '$b_track_');
+</script>
