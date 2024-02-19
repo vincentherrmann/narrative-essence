@@ -6,13 +6,17 @@ import argparse
 import torch
 import torch.nn.functional as F
 import numpy as np
-import os.path
-import json
-import urllib
 import sys
-from pathlib import Path
+import os
+import socket
+from copy import deepcopy
 from types import SimpleNamespace
 from experiment_utilities.misc import fix_seed, seed_everything
+from experiment_utilities.wandb_logging import Logger
+
+from encoders import (LSTMAudioFeatureEncoder, PrecomputedAudioFeatureEncoder, PrecomputedAudioFeaturePCAEncoder,
+                      OrderingLSTMEncoder)
+from datasets import AudioFeatureDataset, AudioFeatureDatasetEchonest, collate_album_features_to_packed_seqs
 
 __version__ = "1.0.0"
 
@@ -25,647 +29,80 @@ def parse_args(args: List[str] = sys.argv[1:]) -> Dict[str, Any]:
                     "pre-computed feature.",
         prog="nee",
     )
-
+    parser.add_argument('--wandb_logging', default=1, type=int, required=False,
+                        help="Whether to log to wandb")
+    parser.add_argument('--cuda', default=1, type=int, required=False,
+                        help="Whether to use CUDA")
+    parser.add_argument('--seed', default=-1, type=int, required=False,
+                        help="Seed for the random number generator")
     parser.add_argument('--save_model', default=1, type=int, required=False,
                         help="Save snapshots of the models")
+    parser.add_argument("--model_path", default="wandb_dir", type=str, required=False,
+                        help="Path to save the model")
     parser.add_argument('--small_dataset', default=0, type=int, required=False,
                         help="Use the subset of data that includes echonest features (has to be 1 if any feature but "
                              "narrative essence is used)")
     parser.add_argument('--normalize_features', default=1, type=int, required=False,
                         help="Normalize the features computed by the feature extractor across a music album")
-
-    args.save_model = True
-    args.small_dataset = False
-    args.normalize_features = True
-    args.use_available_feature = False
-    args.available_feature_to_use = "learned"
-
-    args.num_negative_examples = 31
-    args.patience_epochs = 20
-    args.feature_encoder_type = "lstm"
-    args.feature_encoder_hidden_units = 128
-    args.feature_encoder_num_layers = 2
-    args.feature_encoder_dropout = 0.1
-    args.num_encoding_features = 1
-
-    args.ordering_encoder_hidden_units = 32
-    args.ordering_encoder_num_layers = 2
-    args.ordering_encoder_bidirectional = True
-    args.ordering_encoder_dropout = 0.0
-    args.ordering_encoder_weight_decay = 1e-5
-
-    print("train narrative essence extractor")
-    train_model(args)
-
-    args.small_dataset = True
-    args.use_available_feature = True
-    args.feature_encoder_type = "mean"
-    args.patience_epochs = 50
-
-    parser.add_argument(
-        "files",
-        nargs="+",
-        help="individual audio files that make up the playlist",
-    )
-    parser.add_argument(
-        "--version",
-        action="version",
-        version="%(prog)s {}".format(__version__),
-    )
-    args = vars(parser.parse_args(args))
-    for filename in args["files"]:
-        assert os.path.isfile(filename)
-    return args
-
-
-class AudioFeatureDataset(torch.utils.data.Dataset):
-    def __init__(
-            self,
-            mode="train",
-            allow_albums_with_missing_tracks=False,
-            shuffle_track_orderings=False,
-            sort_track_orderings=False,
-            normalize_features=True,
-            include_learned_feature=False,
-    ):
-        super().__init__()
-        self.data_dir = os.path.join(Path(__file__).parent, "data")
-        if not os.path.exists(self.data_dir):
-            os.mkdir(self.data_dir)
-        self.allow_albums_with_missing_tracks = allow_albums_with_missing_tracks
-        self.include_learned_feature = include_learned_feature
-        dataset = self.create_dataset_file(allow_albums_with_missing_tracks)
-
-        self.audio_features_mean = dataset["audio_features"].mean(dim=0)
-        self.audio_features_std = dataset["audio_features"].std(dim=0)
-        self.audio_features_std[self.audio_features_std == 0.0] = 1.0
-
-        self.durations_mean = dataset["durations"].float().mean(dim=0)
-        self.durations_std = dataset["durations"].float().std(dim=0)
-
-        if normalize_features:
-            dataset["audio_features"] = (
-                                                dataset["audio_features"] - self.audio_features_mean
-                                        ) / self.audio_features_std
-            dataset["durations"] = (
-                                           dataset["durations"].float() - self.durations_mean
-                                   ) / self.durations_std
-
-        if shuffle_track_orderings:
-            dataset = self.shuffle_indices(dataset)
-        elif sort_track_orderings:
-            dataset = self.sort_album_tracks_by_audio_feature_mean(dataset)
-
-        album_indices = dataset["album_indices"]
-        split = dataset["split"]
-
-        if mode == "validation":
-            split_mode = 1
-        elif mode == "test":
-            split_mode = 2
-        else:
-            split_mode = 0
-
-        album_in_dataset = split[album_indices] == split_mode
-        if mode == "full":
-            album_in_dataset = torch.ones_like(album_in_dataset)
-        self.album_indices = album_indices[album_in_dataset]
-        self.album_lengths = dataset["album_lengths"][album_in_dataset]
-        self.album_ids = dataset["album_ids"][album_in_dataset]
-
-        self.audio_features = dataset["audio_features"]
-        self.durations = dataset["durations"]
-        self.track_numbers = dataset["track_numbers"]
-
-    def __getitem__(self, item):
-        album_idx = self.album_indices[item]
-        l = self.album_lengths[item]
-        a = self.audio_features[album_idx: album_idx + l]
-        d = self.durations[album_idx: album_idx + l]
-        n = self.track_numbers[album_idx: album_idx + l]
-
-        features = torch.cat([a, d.unsqueeze(1).repeat(1, 7)], dim=1)
-
-        if self.include_learned_feature:
-            album_id = self.album_ids[item].item()
-            learned_features = self.learned_feature_dict[album_id]
-            return {
-                "features": features,
-                "track_numbers": n,
-                "learned_features": learned_features.unsqueeze(1),
-            }
-        else:
-            return {"features": features, "track_numbers": n}
-
-    def __len__(self):
-        return len(self.album_indices)
-
-    def shuffle_indices(self, dataset):
-        # shuffle the track ordering of each album. Only for testing purposes.
-        print("shuffle track orderings")
-        index_lookup = []
-        for i in range(len(dataset["album_indices"])):
-            album_idx = dataset["album_indices"][i]
-            l = dataset["album_lengths"][i]
-            p = torch.randperm(l)
-            index_lookup.append(album_idx + p)
-        index_lookup = torch.cat(index_lookup)
-        dataset["audio_features"] = dataset["audio_features"][index_lookup]
-        dataset["durations"] = dataset["durations"][index_lookup]
-        dataset["track_numbers"] = dataset["track_numbers"][index_lookup]
-        return dataset
-
-    def sort_album_tracks_by_audio_feature_mean(self, dataset):
-        # sort the track ordering of each album by the mean of the audio features, so that we can be sure that there is
-        # some structure. Only for testing purposes.
-        print("sort track orderings")
-        audio_feature_mean = dataset["audio_features"].mean(dim=1)
-
-        index_lookup = []
-        for i in range(len(dataset["album_indices"])):
-            album_idx = dataset["album_indices"][i]
-            l = dataset["album_lengths"][i]
-            sorting_criterion = audio_feature_mean[album_idx: album_idx + l]
-            p = torch.sort(sorting_criterion)
-            index_lookup.append(album_idx + p[1])
-        index_lookup = torch.cat(index_lookup)
-        audio_feature_mean_sorted = audio_feature_mean[index_lookup]
-        dataset["audio_features"] = dataset["audio_features"][index_lookup]
-        dataset["durations"] = dataset["durations"][index_lookup]
-        dataset["track_numbers"] = dataset["track_numbers"][index_lookup]
-        return dataset
-
-    def create_dataset_file(self, allow_albums_with_missing_tracks: bool = True) -> Dict[str, Any]:
-        if allow_albums_with_missing_tracks:
-            self.dataset_file = os.path.join(
-                self.data_dir, "fma_album_audio_feature_dataset.p"
-            )
-        else:
-            self.dataset_file = os.path.join(
-                self.data_dir, "fma_album_audio_feature_dataset_only_full_albums.p"
-            )
-
-        if self.include_learned_feature:
-            self.learned_feature_dict = {}
-            json_path = os.path.join(self.data_dir, "fma_albums_learned_feature.json")
-            if not os.path.exists(json_path):
-                print("downloading fma_albums_learned_feature.json")
-                urllib.request.urlretrieve(
-                    "https://storage.googleapis.com/narrative-essence-public-data/fma_albums_learned_feature.json",
-                    json_path,
-                )
-            with open(json_path, "rb") as f:
-                albums_with_learned_features = json.load(f)
-            for album in albums_with_learned_features:
-                learned_features = torch.Tensor(
-                    [t["learned scalar feature"] for t in album]
-                )
-                self.learned_feature_dict[album[0]["album id"]] = learned_features
-
-        if os.path.exists(self.dataset_file):
-            return torch.load(self.dataset_file)
-
-        print("creating dataset file")
-        json_path = os.path.join(self.data_dir, "fma_albums_full.json")
-
-        if not os.path.exists(json_path):
-            print("downloading fma_albums_full.json")
-            urllib.request.urlretrieve(
-                "https://storage.googleapis.com/narrative-essence-public-data/fma_albums_full.json",
-                json_path,
-            )
-
-        with open(json_path, "rb") as f:
-            dataset_list = json.load(f)
-
-        filtered_dataset_list = []
-        for album in dataset_list:
-            track_numbers = [t["track number"] for t in album]
-            if track_numbers[0] == 0:
-                print("add 1 to track numbers")
-                track_numbers = [n + 1 for n in track_numbers]
-                for t in album:
-                    t["track number"] += 1
-            duplicates = [x for x in track_numbers if track_numbers.count(x) > 1]
-            if len(duplicates) > 0:
-                print("skip album")
-                continue
-            if not self.allow_albums_with_missing_tracks:
-                num_album_tracks = album[0]["album tracks"]
-                if len(track_numbers) != num_album_tracks:
-                    print("skip album")
-                    continue
-                if track_numbers[-1] != num_album_tracks:
-                    print("skip album")
-                    continue
-            filtered_dataset_list.append(album)
-
-        audio_features = []
-        durations = []
-        track_numbers = []
-        split = []
-        album_indices = []
-        album_lengths = []
-        album_ids = []
-
-        for album in filtered_dataset_list:
-            album_indices.append(len(durations))
-            album_lengths.append(len(album))
-            for track in album:
-                audio_features.append(torch.Tensor(track["fma_audio_features"]))
-                durations.append(track["track duration"])
-                track_numbers.append(track["track number"])
-                split.append(track["set split"])
-            album_ids.append(track["album id"])
-
-        audio_features = torch.stack(audio_features, dim=0)
-        durations = torch.LongTensor(durations)
-        track_numbers = torch.LongTensor(track_numbers)
-        split_dict = {"training": 0, "validation": 1, "test": 2}
-        split = torch.Tensor([split_dict[s] for s in split]).long()
-        album_indices = torch.LongTensor(album_indices)
-        album_lengths = torch.LongTensor(album_lengths)
-        album_ids = torch.LongTensor(album_ids)
-
-        dataset_list = {
-            "audio_features": audio_features,
-            "durations": durations,
-            "split": split,
-            "track_numbers": track_numbers,
-            "album_indices": album_indices,
-            "album_lengths": album_lengths,
-            "album_ids": album_ids,
-        }
-
-        torch.save(dataset_list, self.dataset_file)
-        return torch.load(self.dataset_file)
-
-
-class AudioFeatureDatasetEchonest(AudioFeatureDataset):
-    def __init__(
-            self,
-            mode="train",
-            allow_albums_with_missing_tracks=False,
-            shuffle_track_orderings=False,
-            sort_track_orderings=False,
-            normalize_features=True,
-            include_learned_feature=False,
-    ):
-
-        super().__init__(
-            mode=mode,
-            allow_albums_with_missing_tracks=allow_albums_with_missing_tracks,
-            shuffle_track_orderings=shuffle_track_orderings,
-            sort_track_orderings=sort_track_orderings,
-            normalize_features=normalize_features,
-            include_learned_feature=include_learned_feature,
-        )
-
-        dataset = torch.load(self.dataset_file)
-
-        self.echonest_features_mean = dataset["echonest_features"].mean(dim=0)
-        self.echonest_features_std = dataset["echonest_features"].std(dim=0)
-        self.echonest_features_std[self.echonest_features_std == 0.0] = 1.0
-
-        if normalize_features:
-            dataset["echonest_features"] = (
-                                                   dataset["echonest_features"] - self.echonest_features_mean
-                                           ) / self.echonest_features_std
-
-        self.echonest_features = dataset["echonest_features"]
-
-    def __getitem__(self, item):
-        album_idx = self.album_indices[item]
-        l = self.album_lengths[item]
-        a = self.audio_features[album_idx: album_idx + l]
-        d = self.durations[album_idx: album_idx + l]
-        n = self.track_numbers[album_idx: album_idx + l]
-        e = self.echonest_features[album_idx: album_idx + l]
-
-        features = torch.cat([a, d.unsqueeze(1).repeat(1, 7)], dim=1)
-        #features = torch.cat([e, d.unsqueeze(1)], dim=1)
-
-        if self.include_learned_feature:
-            album_id = self.album_ids[item].item()
-            learned_features = self.learned_feature_dict[album_id]
-            return {
-                "features": features,
-                "echonest_features": e,
-                "track_numbers": n,
-                "learned_features": learned_features.unsqueeze(1),
-                "duration": d
-            }
-        else:
-            return {
-                "features": features,
-                "echonest_features": e,
-                "track_numbers": n,
-                "duration": d
-            }
-
-    def create_dataset_file(self, allow_albums_with_missing_tracks=True):
-        if allow_albums_with_missing_tracks:
-            self.dataset_file = os.path.join(
-                self.data_dir, "fma_album_echonest_audio_feature_dataset.p"
-            )
-        else:
-            self.dataset_file = os.path.join(
-                self.data_dir,
-                "fma_album_echonest_audio_feature_dataset_only_full_albums.p",
-            )
-
-        if self.include_learned_feature:
-            self.learned_feature_dict = {}
-            json_path = os.path.join(self.data_dir, "fma_albums_learned_feature.json")
-            if not os.path.exists(json_path):
-                print("downloading fma_albums_learned_feature.json")
-                urllib.request.urlretrieve(
-                    "https://storage.googleapis.com/narrative-essence-public-data/fma_albums_learned_feature.json",
-                    json_path,
-                )
-            with open(json_path, "rb") as f:
-                albums_with_learned_features = json.load(f)
-            for album in albums_with_learned_features:
-                learned_features = torch.Tensor(
-                    [t["learned scalar feature"] for t in album]
-                )
-                self.learned_feature_dict[album[0]["album id"]] = learned_features
-
-        if os.path.exists(self.dataset_file):
-            return torch.load(self.dataset_file)
-
-        print("creating dataset file")
-        json_path = os.path.join(self.data_dir, "fma_albums_small.json")
-
-        if not os.path.exists(json_path):
-            print("downloading fma_albums_small.json")
-            urllib.request.urlretrieve(
-                "https://storage.googleapis.com/narrative-essence-public-data/fma_albums_small.json",
-                json_path,
-            )
-
-        with open(json_path, "rb") as f:
-            dataset_list = json.load(f)
-
-        filtered_dataset_list = []
-        for album in dataset_list:
-            track_numbers = [t["track number"] for t in album]
-            if track_numbers[0] == 0:
-                print("add 1 to track numbers")
-                track_numbers = [n + 1 for n in track_numbers]
-                for t in album:
-                    t["track number"] += 1
-            duplicates = [x for x in track_numbers if track_numbers.count(x) > 1]
-            if len(duplicates) > 0:
-                print("skip album")
-                continue
-            if album[0]["album id"] == 284:
-                # for some reason the album with ID 284 does not exist in the full dataset
-                print("skip album")
-                continue
-            if not self.allow_albums_with_missing_tracks:
-                num_album_tracks = album[0]["album tracks"]
-                if len(track_numbers) != num_album_tracks:
-                    print("skip album")
-                    continue
-                if track_numbers[-1] != num_album_tracks:
-                    print("skip album")
-                    continue
-            filtered_dataset_list.append(album)
-
-        audio_features = []
-        echonest_features = []
-        durations = []
-        track_numbers = []
-        split = []
-        album_indices = []
-        album_lengths = []
-        album_ids = []
-
-        for album in filtered_dataset_list:
-            album_indices.append(len(durations))
-            album_lengths.append(len(album))
-            for track in album:
-                audio_features.append(torch.zeros(0))
-                echonest_features.append(
-                    torch.Tensor(
-                        [
-                            track["acousticness"],
-                            track["danceability"],
-                            track["energy"],
-                            track["instrumentalness"],
-                            track["liveness"],
-                            track["speechiness"],
-                            track["tempo"],
-                            track["valence"],
-                        ]
-                    )
-                )
-                durations.append(track["track duration"])
-                track_numbers.append(track["track number"])
-                split.append(track["set split"])
-            album_ids.append(track["album id"])
-
-        audio_features = torch.stack(audio_features, dim=0)
-        echonest_features = torch.stack(echonest_features, dim=0)
-        durations = torch.LongTensor(durations)
-        track_numbers = torch.LongTensor(track_numbers)
-        split_dict = {"training": 0, "validation": 1, "test": 2}
-        split = torch.Tensor([split_dict[s] for s in split]).long()
-        album_indices = torch.LongTensor(album_indices)
-        album_lengths = torch.LongTensor(album_lengths)
-        album_ids = torch.LongTensor(album_ids)
-
-        dataset_dict = {
-            "audio_features": audio_features,
-            "echonest_features": echonest_features,
-            "durations": durations,
-            "split": split,
-            "track_numbers": track_numbers,
-            "album_indices": album_indices,
-            "album_lengths": album_lengths,
-            "album_ids": album_ids,
-        }
-
-        torch.save(dataset_dict, self.dataset_file)
-        return torch.load(self.dataset_file)
-
-
-def collate_album_features_to_packed_seqs(album_feature_dict):
-    keys = album_feature_dict[0].keys()
-    feature_dict = {
-        k: [album_feature_dict[j][k] for j in range(len(album_feature_dict))] for k in keys
-    }
-    sequence_lengths = torch.LongTensor([s.shape[0] for s in feature_dict["features"]])
-    packed_sequences_dict = {
-        k: torch.nn.utils.rnn.pack_sequence(feature_dict[k], enforce_sorted=False)
-        for k in keys
-    }
-    packed_sequences_dict["sequence_lengths"] = sequence_lengths
-    return packed_sequences_dict
-
-
-
-    # return: [track_features: PackedSequence, durations: PackedSequence,
-    #          track_numbers: PackedSequence, sequence_length: LongTensor]
-    # n = len(album_feature_list[0])
-    # feature_list = [
-    #     [album_feature_list[j][k] for j in range(len(album_feature_list))]
-    #     for k in range(n)
-    # ]
-    # sequence_lengths = torch.LongTensor([s.shape[0] for s in feature_list[0]])
-    # packed_sequences = [
-    #     torch.nn.utils.rnn.pack_sequence(seqs, enforce_sorted=False)
-    #     for seqs in feature_list
-    # ]
-    # return packed_sequences + [sequence_lengths]
-
-
-class LSTMAudioFeatureEncoder(torch.nn.Module):
-    def __init__(
-            self,
-            num_in_features,
-            hidden_size,
-            num_layers,
-            bidirectional=True,
-            num_out_features=1,
-            dropout=0.1,
-    ):
-        super().__init__()
-        self.num_in_features = num_in_features
-        self.lstm = torch.nn.LSTM(
-            input_size=num_in_features,
-            hidden_size=hidden_size,
-            bidirectional=bidirectional,
-            num_layers=num_layers,
-            batch_first=True,
-            dropout=dropout,
-        )
-        d = 2 if bidirectional else 1
-        #self.h0 = torch.nn.Parameter(torch.randn(d * num_layers, 1, hidden_size))
-        #self.c0 = torch.nn.Parameter(torch.randn(d * num_layers, 1, hidden_size))
-        self.output_transformation = torch.nn.Linear(
-            hidden_size * d * num_layers, num_out_features
-        )
-
-    def forward(self, input):
-        input = input["features"]
-        # x: seq_length x batch_size x 525
-        # transform to (seq_length x batch_size) x -1 x 7
-        feature_batch_size = input.shape[0] * input.shape[1]
-        x = input.view(feature_batch_size, -1, self.num_in_features)
-
-        output, (h_n, c_n) = self.lstm(x)
-        encoding = h_n.transpose(0, 1).reshape(feature_batch_size, -1)
-        x = self.output_transformation(encoding)
-        x = torch.sigmoid(x)
-        x = x.view(input.shape[0], input.shape[1], -1)
-        return x
-
-
-class PrecomputedAudioFeatureEncoder(torch.nn.Module):
-    def __init__(self, feature):
-        super().__init__()
-        self.p = torch.nn.Parameter(torch.zeros(1))
-        self.feature_dict = {
-            "acousticness": 0,
-            "danceability": 1,
-            "energy": 2,
-            "instrumentalness": 3,
-            "liveness": 4,
-            "speechiness": 5,
-            "tempo": 6,
-            "valence": 7,
-        }
-        self.feature = feature
-
-    def forward(self, x):
-        if self.feature == "duration":
-            return x["duration"][..., None]
-        elif self.feature == "all":
-            features = torch.cat([x["echonest_features"], x["duration"].unsqueeze(-1)], dim=-1)
-            return features
-        elif self.feature == "precomputed_learned":
-            return x["learned_features"]
-        else:
-            features = x["echonest_features"][..., self.feature_dict[self.feature]][..., None]
-            return features
-
-
-
-class Mean(torch.nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.p = torch.nn.Parameter(torch.zeros(1))
-
-    def forward(self, x):
-        return x.mean(dim=-1)[..., None]
-
-
-class OrderingLSTMEncoder(torch.nn.Module):
-    def __init__(
-            self, input_size, hidden_size, num_layers=1, bidirectional=True, dropout=0.0
-    ):
-        super().__init__()
-        self.lstm = torch.nn.LSTM(
-            input_size=hidden_size,
-            hidden_size=hidden_size,
-            bidirectional=True if bidirectional else False,
-            num_layers=num_layers,
-            batch_first=False,
-            dropout=dropout,
-        )
-        d = 2 if bidirectional else 1
-        self.input_projection = torch.nn.Linear(
-            in_features=input_size, out_features=hidden_size
-        )
-        self.output_projection = torch.nn.Linear(
-            in_features=d * hidden_size * num_layers, out_features=1
-        )
-        self.start_embedding = torch.nn.Parameter(torch.randn(1, 1, hidden_size))
-        self.end_embedding = torch.nn.Parameter(torch.randn(1, 1, hidden_size))
-        self.h0 = torch.nn.Parameter(torch.randn(d * num_layers, 1, hidden_size))
-        self.c0 = torch.nn.Parameter(torch.randn(d * num_layers, 1, hidden_size))
-
-    def forward(self, padded_seqs, seq_lengths):
-        # x: padded_seq_length x batch_size x num_features
-        # seq_lengths: batch_size
-        batch_size = padded_seqs.shape[1]
-        padded_seqs = self.input_projection(padded_seqs)
-        padded_seqs = F.pad(padded_seqs, [0, 0, 0, 0, 0, 1])
-
-        # add start of sequence
-        padded_seqs = torch.cat(
-            [self.start_embedding.repeat(1, batch_size, 1), padded_seqs], dim=0
-        )
-        # add end_of sequence
-        padded_seqs[
-            seq_lengths, torch.arange(batch_size).to(padded_seqs.device)
-        ] = self.end_embedding.repeat(1, batch_size, 1)
-
-        narrative_features_packed_list = torch.nn.utils.rnn.pack_padded_sequence(
-            padded_seqs,
-            lengths=seq_lengths.cpu() + 2,
-            enforce_sorted=False,
-            batch_first=False,
-        )
-
-        output, (h_n, c_n) = self.lstm(
-            narrative_features_packed_list,
-            (self.h0.repeat(1, batch_size, 1), self.c0.repeat(1, batch_size, 1)),
-        )
-        encoding = h_n.transpose(0, 1).reshape(batch_size, -1)
-        score = self.output_projection(encoding)
-        return score, encoding
+    parser.add_argument('--include_learned_feature', default=0, type=int, required=False,
+                        help="whether to include the learned feature in the dataset set")
+    parser.add_argument('--song_features', default="learned", type=str, required=False,
+                        help="The features to use for the song. Options: "
+                             "acousticness, danceability, energy, instrumentalness, liveness, speechiness, tempo, "
+                             "valence, duration, precomputed_learned, learned_frozen, learned, pca, all")
+
+    parser.add_argument('--num_negative_examples', default=31, type=int, required=False,
+                        help="Number of negative examples to use for the MI estimator")
+    parser.add_argument('--patience_epochs', default=1, type=int, required=False,
+                        help="Number of epochs to wait before early stopping")
+    parser.add_argument('--feature_encoder_type', default="lstm", type=str, required=False,
+                        help="Type of the feature encoder. Options: lstm, mean")
+    parser.add_argument('--feature_encoder_hidden_units', default=128, type=int, required=False,
+                        help="Number of hidden units in the feature encoder")
+    parser.add_argument('--feature_encoder_num_layers', default=2, type=int, required=False,
+                        help="Number of layers in the feature encoder")
+    parser.add_argument('--feature_encoder_dropout', default=0.1, type=float, required=False,
+                        help="Dropout in the feature encoder")
+    parser.add_argument('--num_encoding_features', default=1, type=int, required=False,
+                        help="Number of features to encode")
+
+    parser.add_argument('--ordering_encoder_hidden_units', default=32, type=int, required=False,
+                        help="Number of hidden units in the ordering encoder")
+    parser.add_argument('--ordering_encoder_num_layers', default=2, type=int, required=False,
+                        help="Number of layers in the ordering encoder")
+    parser.add_argument('--ordering_encoder_bidirectional', default=1, type=int, required=False,
+                        help="Whether the ordering encoder is bidirectional")
+    parser.add_argument('--ordering_encoder_dropout', default=0.0, type=float, required=False,
+                        help="Dropout in the ordering encoder")
+    parser.add_argument('--ordering_encoder_weight_decay', default=1e-5, type=float, required=False,
+                        help="Weight decay in the ordering encoder")
+
+    return parser.parse_args(args)
 
 
 def train_model(args):
-    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    log_with_wandb = args.wandb_logging > 0
+    args.server = socket.gethostname()
+    hyperparameters = dict(vars(args))
+
+    logger = Logger(enabled=log_with_wandb,
+                    print_logs_to_console=not log_with_wandb,
+                    project="narrative-essence",
+                    tags=[],
+                    config=hyperparameters)
+
+    if args.model_path == "wandb_dir" and log_with_wandb:
+        model_path = logger().run.dir
+    else:
+        model_path = args.model_path
+
+    dev = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu") if args.cuda else 'cpu'
     #dev = 'cpu'
 
     args.save_model = args.save_model and not args.small_dataset and args.song_features == "learned"
 
-    #torch.manual_seed(1234)
+    if args.seed >= 0:
+        seed_everything(args.seed)
     num_negative_examples = args.num_negative_examples
 
     use_learned_feature = args.include_learned_feature
@@ -703,14 +140,18 @@ def train_model(args):
         )
         num_encoding_features = args.num_encoding_features
         if args.song_features == "learned_frozen":
-            saved_encoder = torch.load('feature_encoder.p')
+
+            saved_encoder = torch.load(os.path.join(model_path, 'feature_encoder.p'))
             feature_encoder.load_state_dict(saved_encoder.state_dict())
             feature_encoder.eval()
             for param in feature_encoder.parameters():
                 param.requires_grad = False
     elif args.song_features == "pca":
         num_encoding_features = args.num_encoding_features
-        raise NotImplementedError
+        feature_encoder = PrecomputedAudioFeaturePCAEncoder(
+            num_output_features=num_encoding_features,
+            dataset=training_set
+        )
     else:
         feature_encoder = PrecomputedAudioFeatureEncoder(args.song_features)
         if args.song_features == "all":
@@ -737,7 +178,7 @@ def train_model(args):
     )
 
     @fix_seed
-    def validate(validation_set):
+    def validate(validation_set, num_iterations=5):
         feature_encoder.eval()
         ordering_encoder.eval()
         all_losses = []
@@ -751,71 +192,73 @@ def train_model(args):
             collate_fn=collate_album_features_to_packed_seqs,
         )
 
-        for batch in iter(validation_loader):
-            batch = {k: v.to(dev) for k, v in batch.items()}
-            seq_lengths = batch["sequence_lengths"]
-            batch_size = seq_lengths.shape[0]
+        with torch.no_grad():
+            for iteration in range(num_iterations):
+                for batch in iter(validation_loader):
+                    batch = {k: v.to(dev) for k, v in batch.items()}
+                    seq_lengths = batch["sequence_lengths"]
+                    batch_size = seq_lengths.shape[0]
 
-            padded_features_dict = {
-                k: v for k, v in batch.items() if k != "sequence_lengths"
-            }
-            padded_features_dict = {
-                k: torch.nn.utils.rnn.pad_packed_sequence(v, padding_value=-1)[0] for k, v in
-                padded_features_dict.items()
-            }
+                    padded_features_dict = {
+                        k: v for k, v in batch.items() if k != "sequence_lengths"
+                    }
+                    padded_features_dict = {
+                        k: torch.nn.utils.rnn.pad_packed_sequence(v, padding_value=-1)[0] for k, v in
+                        padded_features_dict.items()
+                    }
 
-            narrative_features = feature_encoder(padded_features_dict)
-            narrative_features = narrative_features.view(
-                -1, batch_size, num_encoding_features
-            )
+                    narrative_features = feature_encoder(padded_features_dict)
+                    narrative_features = narrative_features.view(
+                        -1, batch_size, num_encoding_features
+                    )
 
-            feature_mask = torch.arange(narrative_features.shape[0], device=dev).unsqueeze(
-                1
-            ) < seq_lengths.unsqueeze(0)
-            feature_mask = feature_mask.unsqueeze(2).float().to(dev)
-            valid_features = narrative_features * feature_mask
+                    feature_mask = torch.arange(narrative_features.shape[0], device=dev).unsqueeze(
+                        1
+                    ) < seq_lengths.unsqueeze(0)
+                    feature_mask = feature_mask.unsqueeze(2).float().to(dev)
+                    valid_features = narrative_features * feature_mask
 
-            # normalize features
-            feature_mean = valid_features.sum(dim=0) / feature_mask.sum(dim=0)
-            feature_var = ((valid_features - feature_mean.unsqueeze(0)) ** 2).sum(
-                dim=0
-            ) / feature_mask.sum(dim=0)
-            feature_std = feature_var ** 0.5
-            valid_features = (valid_features - feature_mean) / feature_std
+                    # normalize features
+                    feature_mean = valid_features.sum(dim=0) / feature_mask.sum(dim=0)
+                    feature_var = ((valid_features - feature_mean.unsqueeze(0)) ** 2).sum(
+                        dim=0
+                    ) / feature_mask.sum(dim=0)
+                    feature_std = feature_var ** 0.5
+                    valid_features = (valid_features - feature_mean) / feature_std
 
-            narrative_features = valid_features
+                    narrative_features = valid_features
 
-            padded_track_number = padded_features_dict["track_numbers"]
-            r_batch = (
-                torch.arange(batch_size)
-                .unsqueeze(1)
-                .repeat(1, num_negative_examples + 1)
-                .flatten()
-            )
-            r_seq_lengths = (
-                seq_lengths.unsqueeze(1).repeat(1, num_negative_examples + 1).flatten()
-            )
-            permutation = [
-                torch.arange(l) if i % batch_size == 0 else torch.randperm(l)
-                for i, l in enumerate(r_seq_lengths)
-            ]
-            padded_permutations = torch.nn.utils.rnn.pad_sequence(permutation).to(dev)
-            shuffled_narrative_features = narrative_features[
-                                          padded_permutations, r_batch.unsqueeze(0), :
-                                          ]
+                    padded_track_number = padded_features_dict["track_numbers"]
+                    r_batch = (
+                        torch.arange(batch_size)
+                        .unsqueeze(1)
+                        .repeat(1, num_negative_examples + 1)
+                        .flatten()
+                    )
+                    r_seq_lengths = (
+                        seq_lengths.unsqueeze(1).repeat(1, num_negative_examples + 1).flatten()
+                    )
+                    permutation = [
+                        torch.arange(l) if i % batch_size == 0 else torch.randperm(l)
+                        for i, l in enumerate(r_seq_lengths)
+                    ]
+                    padded_permutations = torch.nn.utils.rnn.pad_sequence(permutation).to(dev)
+                    shuffled_narrative_features = narrative_features[
+                                                  padded_permutations, r_batch.unsqueeze(0), :
+                                                  ]
 
-            ordering_scores, ordering_encodings = ordering_encoder(
-                shuffled_narrative_features, r_seq_lengths
-            )
-            ordering_scores = ordering_scores.view(
-                batch_size, num_negative_examples + 1
-            )
-            targets = torch.zeros(batch_size, dtype=torch.long).to(dev) + 0
+                    ordering_scores, ordering_encodings = ordering_encoder(
+                        shuffled_narrative_features, r_seq_lengths
+                    )
+                    ordering_scores = ordering_scores.view(
+                        batch_size, num_negative_examples + 1
+                    )
+                    targets = torch.zeros(batch_size, dtype=torch.long).to(dev) + 0
 
-            loss = F.cross_entropy(ordering_scores.detach(), targets, reduction="none")
-            for i, l in enumerate(loss):
-                losses_per_num_tracks[seq_lengths[i].item()].append(l.cpu().detach())
-            all_losses.append(loss.detach())
+                    loss = F.cross_entropy(ordering_scores.detach(), targets, reduction="none")
+                    for i, l in enumerate(loss):
+                        losses_per_num_tracks[seq_lengths[i].item()].append(l.cpu().detach())
+                    all_losses.append(loss.detach())
         mean_loss_per_num_tracks = {
             k: torch.stack(v).mean().item() if len(v) > 0 else 0.0
             for k, v in losses_per_num_tracks.items()
@@ -898,6 +341,10 @@ def train_model(args):
             feature_encoder_optimizer.zero_grad()
             ordering_encoder_optimizer.zero_grad()
             loss.backward()
+            if step % 100 == 0:
+                logger().log({
+                    "training_loss": loss.item(),
+                }, step=step)
             feature_encoder_optimizer.step()
             ordering_encoder_optimizer.step()
 
@@ -906,17 +353,6 @@ def train_model(args):
 
             step += 1
         validation_loss, validation_mean_loss_per_num_tracks = validate(validation_set)
-        if not args.small_dataset:
-            small_validation_loss, small_validation_mean_loss_per_num_tracks = validate(
-                small_validation_set
-            )
-            print(f"small validation loss: {small_validation_loss}")
-            print(
-                f"small validation MI lower bound: {np.log(num_negative_examples + 1) - small_validation_loss} nats"
-            )
-            print(
-                f"small validation MI lower bound: {(np.log(num_negative_examples + 1) - small_validation_loss) * np.log2(np.e)} bits"
-            )
         validation_mi_lower_bound = np.log(num_negative_examples + 1) - validation_loss
 
         training_mean_loss_per_num_tracks = {
@@ -932,11 +368,11 @@ def train_model(args):
                 print("save models")
                 torch.save(
                     feature_encoder.cpu(),
-                    os.path.join(os.getcwd(), "feature_encoder.p"),
+                    os.path.join(model_path, "feature_encoder.p"),
                 )
                 torch.save(
                     ordering_encoder.cpu(),
-                    os.path.join(os.getcwd(), "ordering_encoder.p"),
+                    os.path.join(model_path, "ordering_encoder.p"),
                 )
                 feature_encoder.to(dev)
                 ordering_encoder.to(dev)
@@ -945,61 +381,36 @@ def train_model(args):
                 print(f"early stopping?best model after epoch {best_epoch}")
                 break
 
-        print(f"validation loss: {validation_loss}")
-        print(f"validation MI lower bound: {validation_mi_lower_bound} nats")
-        # print in bits
-        print(f"validation MI lower bound: {validation_mi_lower_bound * np.log2(np.e)} bits")
+        validation_mi_lower_bound_bits = validation_mi_lower_bound * np.log2(np.e)
+        logger().log({
+            "validation_loss": validation_loss,
+            "validation_mi_lower_bound": validation_mi_lower_bound_bits,
+            "epoch": epoch,
+        }, step=step)
 
     highest_mi_lower_bound = np.log(num_negative_examples + 1) - lowest_validation_loss
-    print(
-        f"Highest MI lower bound: {highest_mi_lower_bound} nats"
-    )
-    print(f"or {highest_mi_lower_bound * np.log2(np.e)} bits\n")
+    highest_mi_lower_bound_bits = highest_mi_lower_bound * np.log2(np.e)
+    logger().log({
+        "highest_mi_lower_bound": highest_mi_lower_bound_bits,
+    }, step=step)
+
+    if args.song_features == "learned" and args.save_model:
+        eval_args = deepcopy(args)
+        eval_args.wandb_logging = 0
+        eval_args.save_model = 0
+        eval_args.model_path = model_path
+        eval_args.song_features = "learned_frozen"
+        eval_args.small_dataset = 1
+        eval_args.patience_epochs = 100
+
+        echonest_mi = train_model(eval_args)
+        logger().log({
+            "echonest_highest_mi_lower_bound": echonest_mi,
+        }, step=step)
+
+    return highest_mi_lower_bound_bits
 
 
 if __name__ == "__main__":
-    args = SimpleNamespace()
-    args.save_model = False
-    args.small_dataset = False
-    args.normalize_features = True
-    args.use_available_feature = False
-    args.available_feature_to_use = "learned"
-
-    args.num_negative_examples = 31
-    args.patience_epochs = 20
-    args.feature_encoder_type = "lstm"
-    args.feature_encoder_hidden_units = 128
-    args.feature_encoder_num_layers = 2
-    args.feature_encoder_dropout = 0.1
-    args.num_encoding_features = 1
-
-    args.ordering_encoder_hidden_units = 32
-    args.ordering_encoder_num_layers = 2
-    args.ordering_encoder_bidirectional = True
-    args.ordering_encoder_dropout = 0.0
-    args.ordering_encoder_weight_decay = 1e-5
-
-    print("train narrative essence extractor")
+    args = parse_args()
     train_model(args)
-
-    args.small_dataset = True
-    args.use_available_feature = True
-    args.feature_encoder_type = "mean"
-    args.patience_epochs = 50
-
-    feature_list = [
-        "acousticness",
-        "danceability",
-        "energy",
-        "instrumentalness",
-        "liveness",
-        "speechiness",
-        "tempo",
-        "valence",
-        "learned",
-    ]
-
-    for feature in feature_list:
-        print(f"estimate MI for the feature {feature}")
-        args.available_feature_to_use = feature
-        train_model(args)
