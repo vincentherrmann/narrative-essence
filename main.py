@@ -29,7 +29,7 @@ def parse_args(args: List[str] = sys.argv[1:]) -> Dict[str, Any]:
                     "pre-computed feature.",
         prog="nee",
     )
-    parser.add_argument('--wandb_logging', default=1, type=int, required=False,
+    parser.add_argument('--wandb_logging', default=0, type=int, required=False,
                         help="Whether to log to wandb")
     parser.add_argument('--cuda', default=1, type=int, required=False,
                         help="Whether to use CUDA")
@@ -39,14 +39,14 @@ def parse_args(args: List[str] = sys.argv[1:]) -> Dict[str, Any]:
                         help="Save snapshots of the models")
     parser.add_argument("--model_path", default="wandb_dir", type=str, required=False,
                         help="Path to save the model")
-    parser.add_argument('--small_dataset', default=0, type=int, required=False,
+    parser.add_argument('--small_dataset', default=1, type=int, required=False,
                         help="Use the subset of data that includes echonest features (has to be 1 if any feature but "
                              "narrative essence is used)")
     parser.add_argument('--normalize_features', default=1, type=int, required=False,
                         help="Normalize the features computed by the feature extractor across a music album")
     parser.add_argument('--include_learned_feature', default=0, type=int, required=False,
                         help="whether to include the learned feature in the dataset set")
-    parser.add_argument('--song_features', default="learned", type=str, required=False,
+    parser.add_argument('--song_features', default="all", type=str, required=False,
                         help="The features to use for the song. Options: "
                              "acousticness, danceability, energy, instrumentalness, liveness, speechiness, tempo, "
                              "valence, duration, precomputed_learned, learned_frozen, learned, pca, all")
@@ -155,7 +155,7 @@ def train_model(args):
     else:
         feature_encoder = PrecomputedAudioFeatureEncoder(args.song_features)
         if args.song_features == "all":
-            num_encoding_features = 9 if use_learned_feature else 8
+            num_encoding_features = 9
         else:
             num_encoding_features = 1
 
