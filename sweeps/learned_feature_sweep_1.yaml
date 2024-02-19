@@ -43,4 +43,4 @@ parameters:
   small_dataset:
     distribution: categorical
     values:
-      - 1
+      - 0

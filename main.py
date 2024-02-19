@@ -53,7 +53,7 @@ def parse_args(args: List[str] = sys.argv[1:]) -> Dict[str, Any]:
 
     parser.add_argument('--num_negative_examples', default=31, type=int, required=False,
                         help="Number of negative examples to use for the MI estimator")
-    parser.add_argument('--patience_epochs', default=1, type=int, required=False,
+    parser.add_argument('--patience_epochs', default=20, type=int, required=False,
                         help="Number of epochs to wait before early stopping")
     parser.add_argument('--feature_encoder_type', default="lstm", type=str, required=False,
                         help="Type of the feature encoder. Options: lstm, mean")
@@ -395,6 +395,7 @@ def train_model(args):
     }, step=step)
 
     if args.song_features == "learned" and args.save_model:
+        print("evaluate learned feature on echonest")
         eval_args = deepcopy(args)
         eval_args.wandb_logging = 0
         eval_args.save_model = 0
