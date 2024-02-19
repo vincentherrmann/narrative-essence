@@ -1,4 +1,4 @@
-program: training_script_rnn_weight_representations.py
+program: main.py
 name: learned_feature_sweep.yaml
 command:
   - ${env}
