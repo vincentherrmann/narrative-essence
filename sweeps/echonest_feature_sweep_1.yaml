@@ -38,14 +38,24 @@ parameters:
   save_model:
     distribution: categorical
     values:
-      - 1
+      - 0
 
   small_dataset:
     distribution: categorical
     values:
-      - 0
+      - 1
 
   song_features:
     distribution: categorical
     values:
-      - learned
+      - acousticness
+      - danceability
+      - energy
+      - instrumentalness
+      - liveness
+      - speechiness
+      - tempo
+      - valence
+      - duration
+      - pca
+      - all
