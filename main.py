@@ -272,7 +272,7 @@ def train_model(args):
     step = 0
     lowest_validation_loss = float("inf")
     best_epoch = 0
-    for epoch in range(200):
+    for epoch in range(1000):
         print(f"epoch {epoch}")
         num_tracks = range(3, 21)
         losses_per_num_tracks = {i: [] for i in num_tracks}
