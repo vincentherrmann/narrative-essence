@@ -1,5 +1,5 @@
 program: main.py
-name: learned_feature_sweep.yaml
+name: precomputed learned feature sweep
 command:
   - ${env}
   - python3
@@ -48,7 +48,7 @@ parameters:
   song_features:
     distribution: categorical
     values:
-      - learned_frozen
+      - precomputed_learned
 
   include_learned_feature:
     distribution: categorical
