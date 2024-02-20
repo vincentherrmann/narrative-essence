@@ -54,3 +54,8 @@ parameters:
     distribution: categorical
     values:
       - 1
+
+  patience_epochs:
+    distribution: categorical
+    values:
+      - 100
