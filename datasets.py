@@ -81,9 +81,12 @@ class AudioFeatureDataset(torch.utils.data.Dataset):
                 "features": features,
                 "track_numbers": n,
                 "learned_features": learned_features.unsqueeze(1),
+                "duration": d
             }
         else:
-            return {"features": features, "track_numbers": n}
+            return {"features": features,
+                    "track_numbers": n,
+                    "duration": d}
 
     def __len__(self):
         return len(self.album_indices)

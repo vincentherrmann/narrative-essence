@@ -1,0 +1,56 @@
+program: main.py
+name: learned_feature_sweep.yaml
+command:
+  - ${env}
+  - python3
+  - ${program}
+  - ${args}
+method: grid
+metric:
+  name: validation loss
+  goal: minimize
+
+parameters:
+  seed:
+    distribution: categorical
+    values:
+      - 1
+      - 2
+      - 3
+      - 4
+      - 5
+      - 6
+      - 7
+      - 8
+      - 9
+      - 10
+      - 11
+      - 12
+      - 13
+      - 14
+      - 15
+
+  wandb_logging:
+    distribution: categorical
+    values:
+      - 1
+
+  save_model:
+    distribution: categorical
+    values:
+      - 0
+
+  small_dataset:
+    distribution: categorical
+    values:
+      - 1
+
+  song_features:
+    distribution: categorical
+    values:
+      - learned_frozen
+
+  include_learned_feature:
+    distribution: categorical
+    values:
+      - 1

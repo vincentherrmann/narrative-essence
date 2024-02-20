@@ -35,18 +35,18 @@ def parse_args(args: List[str] = sys.argv[1:]) -> Dict[str, Any]:
                         help="Whether to use CUDA")
     parser.add_argument('--seed', default=-1, type=int, required=False,
                         help="Seed for the random number generator")
-    parser.add_argument('--save_model', default=1, type=int, required=False,
+    parser.add_argument('--save_model', default=0, type=int, required=False,
                         help="Save snapshots of the models")
     parser.add_argument("--model_path", default="wandb_dir", type=str, required=False,
                         help="Path to save the model")
-    parser.add_argument('--small_dataset', default=1, type=int, required=False,
+    parser.add_argument('--small_dataset', default=0, type=int, required=False,
                         help="Use the subset of data that includes echonest features (has to be 1 if any feature but "
                              "narrative essence is used)")
     parser.add_argument('--normalize_features', default=1, type=int, required=False,
                         help="Normalize the features computed by the feature extractor across a music album")
     parser.add_argument('--include_learned_feature', default=0, type=int, required=False,
                         help="whether to include the learned feature in the dataset set")
-    parser.add_argument('--song_features', default="all", type=str, required=False,
+    parser.add_argument('--song_features', default="duration", type=str, required=False,
                         help="The features to use for the song. Options: "
                              "acousticness, danceability, energy, instrumentalness, liveness, speechiness, tempo, "
                              "valence, duration, precomputed_learned, learned_frozen, learned, pca, all")
@@ -305,6 +305,7 @@ def train_model(args):
                 dim=0
             ) / feature_mask.sum(dim=0)
             feature_std = feature_var ** 0.5
+            feature_std[feature_std < 1e-5] = 1.0
             valid_features = (valid_features - feature_mean) / feature_std
 
             narrative_features = valid_features
@@ -341,6 +342,10 @@ def train_model(args):
             feature_encoder_optimizer.zero_grad()
             ordering_encoder_optimizer.zero_grad()
             loss.backward()
+
+            torch.nn.utils.clip_grad_norm_(feature_encoder.parameters(), 0.1)
+            torch.nn.utils.clip_grad_norm_(ordering_encoder.parameters(), 0.1)
+
             if step % 100 == 0:
                 logger().log({
                     "training_loss": loss.item(),
